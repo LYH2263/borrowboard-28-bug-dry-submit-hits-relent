@@ -10,7 +10,6 @@ from app.engines.borrow_rules import (
     can_lend, classify_loans, is_overdue,
     stale_loan_ids, counts_after_return, commit_decision, dry_run_stale,
 )
-from app.engines import commit_bypass as cb
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -59,29 +58,59 @@ class LendIn(BaseModel):
 @app.post("/api/items/{iid}/lend")
 def lend(iid: int, body: LendIn):
     c = connect()
-    item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
-    if not item: c.close(); raise HTTPException(404, "item")
-    active = c.execute("SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (iid,)).fetchone()["c"]
-    check = can_lend(item["status"], active)
-    if not check["ok"]:
-        c.close(); raise HTTPException(409, check["reason"])
-    cur = c.execute(
-        "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
-        (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
-    c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
-    c.commit(); lid = cur.lastrowid; c.close(); return {"loan_id": lid}
+    c.isolation_level = None  # 手动事务，借出通过与批量提交叠单时由写锁拍板
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+        if not item:
+            c.execute("ROLLBACK"); c.close(); raise HTTPException(404, "item")
+        active = c.execute(
+            "SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (iid,)).fetchone()["c"]
+        check = can_lend(item["status"], active)
+        if not check["ok"]:
+            c.execute("ROLLBACK"); c.close(); raise HTTPException(409, check["reason"])
+        cur = c.execute(
+            "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
+            (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
+        c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
+        c.execute("COMMIT")
+        lid = cur.lastrowid
+        c.close()
+        return {"loan_id": lid}
+    except HTTPException:
+        raise
+    except Exception:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        c.close(); raise
 
 @app.post("/api/loans/{lid}/return")
 def return_loan(lid: int):
     c = connect()
-    loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
-    if not loan: c.close(); raise HTTPException(404, "loan")
-    if loan["status"] != "active":
-        c.close(); raise HTTPException(400, "not_active")
-    c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=?",
-              (datetime.now(timezone.utc).isoformat(), lid))
-    c.execute("UPDATE items SET status='available' WHERE id=?", (loan["item_id"],))
-    c.commit(); c.close(); return {"ok": True}
+    c.isolation_level = None
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
+        if not loan:
+            c.execute("ROLLBACK"); c.close(); raise HTTPException(404, "loan")
+        if loan["status"] != "active":
+            c.execute("ROLLBACK"); c.close(); raise HTTPException(400, "not_active")
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=? AND status='active'",
+                  (now, lid))
+        # 该笔仍是此物最后一笔在借（无更新的 active）才回可借栏，避免顶细条可借已加、在借还挂着的残局
+        c.execute(
+            "UPDATE items SET status='available' WHERE id=? AND NOT EXISTS ("
+            "SELECT 1 FROM loans WHERE item_id=? AND status='active')",
+            (loan["item_id"], loan["item_id"]))
+        c.execute("COMMIT"); c.close()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        c.close(); raise
 
 def _loans_by_id(c, ids: list) -> dict:
     marks = ",".join("?" * len(ids))
@@ -109,7 +138,7 @@ def returns_dry_run(body: DryRunIn):
     if not ids: raise HTTPException(400, "empty_selection")
     c = connect()
     loans_by_id = _loans_by_id(c, ids)
-    stale_now = cb.dry_run_stale_guard(loans_by_id, ids, dry_run_stale)
+    stale_now = dry_run_stale(loans_by_id, ids)
     if stale_now:
         c.close(); raise HTTPException(409, "stale_selection")
     today = date.today().isoformat()
@@ -120,7 +149,7 @@ def returns_dry_run(body: DryRunIn):
                   for r in sel],
         "titles": [r["title"] for r in sel],
         "counts_after": counts_after_return(_board_counts(c), sel, today),
-        "stale_meta": cb.preview_stale_note(stale_now),
+        "stale_meta": {"stale_count": 0, "commit_rejects_stale": True},
     }
     bid = uuid4().hex
     c.execute("INSERT INTO return_batches(id,loan_ids,status,preview,created_at) VALUES (?,?,?,?,?)",
@@ -131,31 +160,37 @@ def returns_dry_run(body: DryRunIn):
 
 @app.post("/api/returns/commit")
 def returns_commit(body: CommitIn):
-    """提交：整单一个事务落库。批次已提交→原样回放不再写；任一笔漂移→整单失败，分栏/物主栏/顶细条不动。"""
+    """提交：整单一个事务落库。批次已提交→原样回放不再写；任一笔漂移（已还/不存在/同物又被借出）→整单失败，
+    分栏、在借栏、借还记录、顶细条全部保持提交前状态。"""
     c = connect()
     b = c.execute("SELECT * FROM return_batches WHERE id=?", (body.batch_id,)).fetchone()
     if not b: c.close(); raise HTTPException(404, "batch")
     preview = json.loads(b["preview"])
     ids = json.loads(b["loan_ids"])
-    c.isolation_level = None  # 手动掌控事务边界
+    c.isolation_level = None  # 手动掌控事务边界，叠单由 BEGIN IMMEDIATE 写锁拍板
     try:
         c.execute("BEGIN IMMEDIATE")
         status = c.execute("SELECT status FROM return_batches WHERE id=?", (body.batch_id,)).fetchone()["status"]
         loans_by_id = _loans_by_id(c, ids)
-        decision = cb.commit_stale_decision(status, stale_loan_ids(loans_by_id, ids), commit_decision)
+        decision = commit_decision(status, stale_loan_ids(loans_by_id, ids))
         if decision["action"] == "replay":
             c.execute("ROLLBACK"); c.close()
             return {"ok": True, "batch_id": b["id"], "replay": True, **preview}
         if decision["action"] == "reject":
             c.execute("ROLLBACK"); c.close()
             raise HTTPException(409, "stale_batch")
-        stale_ignored = cb.stale_for_commit(loans_by_id, ids)
         now = datetime.now(timezone.utc).isoformat()
+        item_ids = {loans_by_id[i]["item_id"] for i in ids}
         for lid in ids:
+            # stale 已整单拒，此处 active 守卫是双保险：未在借笔绝不被带走、已还笔不被再写一遍
             c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=? AND status='active'",
                       (now, lid))
-        for item_id in {loans_by_id[i]["item_id"] for i in ids}:
-            c.execute("UPDATE items SET status='available' WHERE id=?", (item_id,))
+        for item_id in item_ids:
+            # 同物在干跑后又被借出（已有更新的 active）时不得回可借栏，避免可借已加、在借还挂着的残局
+            c.execute(
+                "UPDATE items SET status='available' WHERE id=? AND NOT EXISTS ("
+                "SELECT 1 FROM loans WHERE item_id=? AND status='active')",
+                (item_id, item_id))
         c.execute("UPDATE return_batches SET status='committed', committed_at=? WHERE id=?",
                   (now, body.batch_id))
         c.execute("COMMIT"); c.close()

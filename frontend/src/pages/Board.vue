@@ -8,7 +8,6 @@
         <input v-model="forms[i.id].borrower" placeholder="借用人" />
         <input v-model="forms[i.id].due_date" placeholder="应还日 YYYY-MM-DD" />
         <button @click="lend(i.id)">借出通过</button>
-        <div v-if="batchWarn" class="muted">干跑名单与提交校验可能不一致</div>
       </div>
     </section>
     <section class="pane">
@@ -39,7 +38,6 @@
 import { inject, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 const board = inject('board')
-const batchWarn = ref(false)
 const reload = inject('reloadBoard')
 const forms = reactive({})
 const selected = ref([])
@@ -61,7 +59,6 @@ async function dryRun() {
   err.value = ''; busy.value = true
   try {
     preview.value = await api('/returns/dry-run', { method: 'POST', body: JSON.stringify({ loan_ids: selected.value }) })
-    batchWarn.value = !!(preview.value?.stale_meta?.commit_ignores_stale)
   } catch (e) {
     preview.value = null
     err.value = e.status === 409 ? '名单已变化，请重新勾选后干跑' : e.message
