@@ -1,0 +1,17 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "10400:10400"
+    volumes:
+      - borrowboard_data:/data
+    environment:
+      DATA_DIR: /data
+  frontend:
+    build: ./frontend
+    ports:
+      - "5400:80"
+    depends_on:
+      - backend
+volumes:
+  borrowboard_data:
