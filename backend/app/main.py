@@ -149,7 +149,6 @@ def returns_commit(body: CommitIn):
         if decision["action"] == "reject":
             c.execute("ROLLBACK"); c.close()
             raise HTTPException(409, "stale_batch")
-        stale_ignored = cb.stale_for_commit(loans_by_id, ids)
         now = datetime.now(timezone.utc).isoformat()
         for lid in ids:
             c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=? AND status='active'",
